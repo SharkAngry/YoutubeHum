@@ -12,7 +12,7 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx
 # CONFIG GÉNÉRALE
 # =========================================================
 st.set_page_config(page_title="YoutubeHum", page_icon="🎧", layout="wide")
-
+# Initialisation des variables de session
 if "history" not in st.session_state:
     st.session_state.history = []
 if "stop_requested" not in st.session_state:
