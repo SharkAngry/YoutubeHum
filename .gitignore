@@ -2,3 +2,17 @@
 .venv/
 venv/
 env/
+# Ne pas envoyer les téléchargements
+YoutubeHum_*/
+Downloads/
+
+# Fichiers système et Python
+__pycache__/
+.venv/
+.DS_Store
+*.pyc
+
+# Fichiers temporaires de téléchargement
+*.part
+*.ytdl
+*.temp
