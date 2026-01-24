@@ -111,10 +111,10 @@ def estimate_remaining(times, total, completed):
 
 def process_video(url, mode, outdir, quality, use_aria2):
     """
-    Télécharge une vidéo YouTube.
+    Télécharge une vidéo YouTube avec extraction des métadonnées.
     
     Returns:
-        tuple: (temps_écoulé, statut, titre_vidéo)
+        tuple: (temps_écoulé, statut, titre_vidéo, taille_fichier_mb, durée_secondes)
     """
     start = time.time()
     
@@ -159,15 +159,33 @@ def process_video(url, mode, outdir, quality, use_aria2):
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Extraction des infos AVANT téléchargement (amélioration)
             info = ydl.extract_info(url, download=False)
-            title = info.get('title', 'Titre inconnu')
+            
+            # Récupération sécurisée des métadonnées
+            title = info.get('title', 'Titre inconnu')[:100]  # Limite à 100 caractères
+            duration = info.get('duration', 0)  # Durée en secondes
+            filesize = info.get('filesize', 0) or info.get('filesize_approx', 0)  # Taille estimée
+            
+            # Téléchargement
             ydl.download([url])
         
         elapsed = time.time() - start
-        return elapsed, "OK", title
+        filesize_mb = filesize / (1024 * 1024) if filesize else 0
+        
+        return elapsed, "OK", title, filesize_mb, duration
     
     except Exception as e:
-        return 0, f"ERREUR: {str(e)}", "Échec"
+        error_msg = str(e)
+        # Simplification du message d'erreur pour l'affichage
+        if "Video unavailable" in error_msg:
+            error_msg = "Vidéo non disponible"
+        elif "Private video" in error_msg:
+            error_msg = "Vidéo privée"
+        elif "copyright" in error_msg.lower():
+            error_msg = "Problème de droits d'auteur"
+        
+        return 0, f"ERREUR: {error_msg}", "Échec", 0, 0
 
 # =========================================================
 # INTERFACE PRINCIPALE
@@ -276,6 +294,8 @@ if start_btn and url_input and is_valid_url:
         failed = 0
         total = len(urls)
         successful_titles = []
+        total_size_mb = 0
+        total_duration = 0
 
         # Téléchargement avec ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=max_parallel) as executor:
@@ -292,22 +312,28 @@ if start_btn and url_input and is_valid_url:
                     break
                 
                 try:
-                    res_time, res_status, title = future.result(timeout=DOWNLOAD_TIMEOUT)
+                    res_time, res_status, title, size_mb, duration = future.result(timeout=DOWNLOAD_TIMEOUT)
                     
                     if res_status == "OK":
                         times.append(res_time)
                         successful_titles.append(title)
+                        total_size_mb += size_mb
+                        total_duration += duration
+                        details.success(f"✅ {title[:60]}... ({format_time(res_time)})")
                     else:
                         failed += 1
-                        details.warning(f"⚠️ Échec : {title}")
+                        details.warning(f"⚠️ {title}: {res_status}")
                     
                     completed += 1
                     progress.progress(completed / total)
                     
+                    # Affichage enrichi avec taille et durée
+                    avg_speed = total_size_mb / sum(times) if times and sum(times) > 0 else 0
                     status.info(
                         f"⏳ Progression : {completed}/{total} "
-                        f"(✅ {len(times)} réussis, ❌ {failed} échoués) "
-                        f"— Temps restant : {estimate_remaining(times, total, completed)}"
+                        f"(✅ {len(times)} | ❌ {failed}) "
+                        f"— Temps restant : {estimate_remaining(times, total, completed)} "
+                        f"— Vitesse moy. : {avg_speed:.1f} MB/s"
                     )
                 
                 except concurrent.futures.TimeoutError:
@@ -336,17 +362,25 @@ if start_btn and url_input and is_valid_url:
                 "count": len(times),
                 "failed": failed,
                 "path": session_dir,
-                "avg_time": sum(times) / len(times) if times else 0
+                "avg_time": sum(times) / len(times) if times else 0,
+                "total_size_mb": total_size_mb,
+                "total_duration": total_duration
             })
             
-            # Affichage du résumé
+            # Affichage du résumé enrichi
             if len(times) > 0:
+                avg_time = sum(times) / len(times)
+                avg_speed = total_size_mb / sum(times) if sum(times) > 0 else 0
+                
                 st.markdown(f"""
                 <div class="success-box">
                     <h3>✅ Téléchargement terminé !</h3>
                     <p><strong>📁 Dossier :</strong> <code>{session_dir}</code></p>
                     <p><strong>✅ Réussis :</strong> {len(times)} / {total}</p>
-                    <p><strong>⏱️ Temps moyen :</strong> {format_time(sum(times) / len(times))}</p>
+                    <p><strong>⏱️ Temps moyen :</strong> {format_time(avg_time)}</p>
+                    <p><strong>💾 Taille totale :</strong> {total_size_mb:.1f} MB</p>
+                    <p><strong>🎬 Durée totale :</strong> {format_time(total_duration)}</p>
+                    <p><strong>⚡ Vitesse moyenne :</strong> {avg_speed:.2f} MB/s</p>
                 </div>
                 """, unsafe_allow_html=True)
                 
@@ -395,3 +429,7 @@ if st.session_state.history:
             st.markdown(f"**Réussis :** {h['count']} | **Échoués :** {h['failed']}")
             if h['avg_time'] > 0:
                 st.markdown(f"**Temps moyen :** {format_time(h['avg_time'])}")
+            if h.get('total_size_mb', 0) > 0:
+                st.markdown(f"**Taille totale :** {h['total_size_mb']:.1f} MB")
+            if h.get('total_duration', 0) > 0:
+                st.markdown(f"**Durée totale :** {format_time(h['total_duration'])}")
