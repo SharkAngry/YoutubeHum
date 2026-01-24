@@ -1,18 +1,53 @@
-# Environnements virtuels Python
-.venv/
-venv/
-env/
-# Ne pas envoyer les téléchargements
-YoutubeHum_*/
-Downloads/
-
-# Fichiers système et Python
+# Python
 __pycache__/
-.venv/
-.DS_Store
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Fichiers temporaires de téléchargement
+# Streamlit
+.streamlit/
+
+# Downloads
+Downloads/
+YoutubeHum_*/
+
+# Temp files
+*.tmp
+*.temp
 *.part
 *.ytdl
-*.temp
+*.f*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
