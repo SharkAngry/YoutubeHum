@@ -423,12 +423,23 @@ if start_btn and url_input and is_valid_url:
             urls = []
 
     if urls:
-        # Création du dossier de destination
+        # Création du dossier de destination avec le nom de la vidéo/playlist
         base_dir = custom_dir if custom_dir else DEFAULT_DOWNLOAD_DIR
-        session_dir = os.path.join(
-            base_dir, 
-            f"YoutubeHum_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        )
+        
+        # Extraire le nom de la playlist ou de la vidéo
+        folder_name = "YoutubeHum"
+        if "title" in info:
+            folder_name = info.get("title", "YoutubeHum")
+            # Nettoyer le nom pour Windows (remplacer caractères invalides)
+            invalid_chars = r'[<>:"/\\|?*]'
+            import re
+            folder_name = re.sub(invalid_chars, '', folder_name)
+            folder_name = folder_name.strip()[:100]  # Limiter à 100 caractères
+        
+        # Ajouter un timestamp pour éviter les collisions
+        folder_name = f"{folder_name}_{datetime.now().strftime('%H%M%S')}"
+        
+        session_dir = os.path.join(base_dir, folder_name)
         
         try:
             os.makedirs(session_dir, exist_ok=True)
@@ -620,7 +631,7 @@ if st.session_state.history:
                 for title, error in h['failed_details']:
                     st.markdown(f"- {title[:50]}... : {error}")
             
-            if st.button(f"📂 Ouvrir", key=f"open_{idx}"):
+            if st.button("📂 Ouvrir", key=f"open_{idx}"):
                 try:
                     os.startfile(h['path'])
                 except Exception as e:
