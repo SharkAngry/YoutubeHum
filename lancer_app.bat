@@ -1,53 +1,41 @@
 @echo off
-title YoutubeHum Launcher
-color 0A
+title YoutubeHum Ultimate Launcher
+setlocal
 
-echo =========================================
-echo        YoutubeHum - Demarrage
-echo =========================================
+:: Couleurs pour le terminal (Bleu)
+color 0B
+
+echo =========================================================
+echo            YOUTUBEHUM ULTIMATE - CHARGEMENT
+echo =========================================================
 echo.
 
-:: Aller dans le dossier du script
-cd /d "%~dp0"
+:: 1. Vérification/Installation des dépendances critiques
+echo [1/3] Verification des modules (yt-dlp, streamlit, certifi)...
+python -m pip install -U yt-dlp streamlit certifi --quiet
 
-:: Vérifier Python
-where python >nul 2>nul
-if %errorlevel% neq 0 (
-    echo Python n'est pas installé ou pas dans le PATH.
+:: 2. Nettoyage du cache Python pour eviter les erreurs de lancement
+echo [2/3] Nettoyage du cache...
+set PYTHONDONTWRITEBYTECODE=1
+
+:: 3. Lancement de l'application
+echo [3/3] Lancement de l'interface Streamlit...
+echo.
+echo ---------------------------------------------------------
+echo SI L'INTERFACE NE S'OUVRE PAS : 
+echo Copiez l'adresse URL qui va s'afficher ci-dessous 
+echo (souvent http://localhost:8501) dans votre navigateur.
+echo ---------------------------------------------------------
+echo.
+
+:: Utilisation de python -m pour contourner l'erreur de PATH
+python -m streamlit run YoutubeHum.py
+
+if %ERRORLEVEL% NEQ 0 (
+    echo.
+    echo [ERREUR] L'application ne s'est pas lancee correctement.
+    echo Verifiez que le fichier YoutubeHum.py est dans le meme dossier.
     pause
-    exit /b
 )
 
-:: Création venv si absent
-if not exist ".venv" (
-    echo Creation environnement virtuel...
-    python -m venv .venv
-)
-
-:: Activation venv
-call .venv\Scripts\activate
-
-:: Upgrade pip silencieux
-python -m pip install --upgrade pip >nul
-
-:: Installer dépendances si besoin
-pip install -U yt-dlp streamlit certifi >nul
-
-:: Vérifier FFmpeg
-where ffmpeg >nul 2>nul
-if %errorlevel% neq 0 (
-    echo.
-    echo ATTENTION : FFmpeg non detecte.
-    echo Telecharge-le et ajoute-le au PATH.
-    echo.
-)
-
-:: Lancer application
-echo.
-echo Lancement de l'application...
-echo.
-streamlit run YoutubeHum.py
-
-echo.
-echo Application fermee.
 pause
