@@ -98,7 +98,7 @@ class TitanEngine:
 
         opts.update({
             'progress_hooks': [hook],
-            'user_agent': random.choice(Config.USER_AGENTS),
+            'http_headers': {'User-Agent': random.choice(Config.USER_AGENTS)},
             'noprogress': True,
         })
 
