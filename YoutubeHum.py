@@ -6,172 +6,182 @@ import sqlite3
 import time
 import certifi
 import yt_dlp
+import shutil
+import pandas as pd
 import streamlit as st
 from datetime import datetime
 from pathlib import Path
+import random
 
 # =========================================================
-# INITIALISATION ET BASE DE DONNÉES
+# CORE CONFIGURATION & CONSTANTS
 # =========================================================
 os.environ['SSL_CERT_FILE'] = certifi.where()
 
-class DBManager:
-    def __init__(self):
-        self.conn = sqlite3.connect('yt_hum.db', check_same_thread=False)
-        self.cursor = self.conn.cursor()
-        self.cursor.execute('''CREATE TABLE IF NOT EXISTS history 
-            (id INTEGER PRIMARY KEY, title TEXT, url TEXT, status TEXT, date TEXT, path TEXT)''')
-        self.conn.commit()
-
-    def add_entry(self, title, url, status, path):
-        self.cursor.execute("INSERT INTO history (title, url, status, date, path) VALUES (?,?,?,?,?)",
-                            (title, url, status, datetime.now().strftime("%Y-%m-%d %H:%M"), path))
-        self.conn.commit()
+class Config:
+    VERSION = "7.0-TITAN"
+    DB_NAME = "yt_hum_pro.db"
+    CHUNK_SIZE = 1024 * 1024 * 10  # 10MB
+    MAX_PLAYLIST_SIZE = 200
+    USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121.0.0.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/13.1.3"
+    ]
 
 # =========================================================
-# LE MOTEUR (ENGINE) - DÉCOUPLÉ DE STREAMLIT
+# DATABASE SERVICE (PERSISTENCE & STATS)
 # =========================================================
-
-class DownloadEngine:
+class Database:
     def __init__(self):
-        self.in_queue = queue.Queue()
+        self.conn = sqlite3.connect(Config.DB_NAME, check_same_thread=False)
+        self._create_tables()
+
+    def _create_tables(self):
+        with self.conn:
+            self.conn.execute('''CREATE TABLE IF NOT EXISTS downloads 
+                (id INTEGER PRIMARY KEY, url TEXT UNIQUE, title TEXT, 
+                status TEXT, path TEXT, size REAL, date TEXT)''')
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_url ON downloads(url)")
+
+    def save_download(self, url, title, status, path, size):
+        with self.conn:
+            self.conn.execute("""INSERT OR REPLACE INTO downloads (url, title, status, path, size, date) 
+                                 VALUES (?, ?, ?, ?, ?, ?)""", 
+                              (url, title, status, path, size, datetime.now().isoformat()))
+
+    def get_history(self, limit=50, offset=0):
+        return pd.read_sql_query(f"SELECT * FROM downloads ORDER BY id DESC LIMIT {limit} OFFSET {offset}", self.conn)
+
+    def clear_history(self):
+        with self.conn: self.conn.execute("DELETE FROM downloads")
+
+# =========================================================
+# ASYNC ENGINE (PARALLELISM & LOGIC)
+# =========================================================
+class TitanEngine:
+    def __init__(self, db):
+        self.db = db
+        self.queue = asyncio.Queue()
         self.out_queue = queue.Queue()
-        self.stop_event = threading.Event()
-        self.pause_event = threading.Event()
-        self.pause_event.set() # True = Running
-        self.current_tasks = {}
-        self.is_active = False
+        self.semaphore = None # Sera initialisé dans l'event loop
+        self.stop_event = asyncio.Event()
+        self.is_paused = False
+        self.active_tasks = {}
 
-    def start(self):
-        if not self.is_active:
-            self.stop_event.clear()
-            threading.Thread(target=self._run_loop, daemon=True).start()
-            self.is_active = True
-
-    def _run_loop(self):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(self._process_queue())
-
-    async def _process_queue(self):
+    async def start_workers(self, worker_count):
+        self.semaphore = asyncio.Semaphore(worker_count)
         while not self.stop_event.is_set():
-            self.pause_event.wait() # Blocage propre si pause
-            
-            try:
-                task = self.in_queue.get(timeout=1)
-            except queue.Empty:
-                continue
+            url, opts = await self.queue.get()
+            asyncio.create_task(self._worker_wrapper(url, opts))
+            self.queue.task_done()
 
-            await self._download_task(task)
-            self.in_queue.task_done()
+    async def _worker_wrapper(self, url, opts):
+        async with self.semaphore:
+            if self.is_paused:
+                while self.is_paused: await asyncio.sleep(1)
+            await self._execute_download(url, opts)
 
-    async def _download_task(self, task):
-        url = task['url']
-        opts = task['opts']
-        
-        def progress_hook(d):
+    async def _execute_download(self, url, opts):
+        # Vérification espace disque
+        total, used, free = shutil.disk_usage(os.path.dirname(opts['outtmpl']))
+        if free < 500 * 1024 * 1024: # < 500MB
+            self.out_queue.put({'type': 'error', 'url': url, 'msg': 'Espace disque insuffisant'})
+            return
+
+        def hook(d):
             if d['status'] == 'downloading':
-                # Protection division par zéro
-                total = d.get('total_bytes') or d.get('total_bytes_estimate', 1)
-                downloaded = d.get('downloaded_bytes', 0)
-                progress = downloaded / total
                 self.out_queue.put({
-                    'type': 'progress', 
-                    'url': url, 
-                    'p': progress, 
-                    'speed': d.get('_speed_str', '0B/s'),
-                    'eta': d.get('_eta_str', 'N/A')
+                    'type': 'progress', 'url': url, 
+                    'p': d.get('downloaded_bytes', 0) / d.get('total_bytes', 1),
+                    'speed': d.get('_speed_str', 'N/A'), 'eta': d.get('_eta_str', 'N/A')
                 })
 
-        opts['progress_hooks'] = [progress_hook]
-        
-        # Vérification si fichier existe déjà (Skip logique)
-        opts['nooverwrites'] = True
-        
+        opts.update({
+            'progress_hooks': [hook],
+            'user_agent': random.choice(Config.USER_AGENTS),
+            'noprogress': True,
+        })
+
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                # Exécution dans un thread séparé pour ne pas bloquer l'event loop
                 info = await asyncio.to_thread(ydl.extract_info, url, download=True)
-                title = info.get('title', 'Video')
-                self.out_queue.put({'type': 'success', 'url': url, 'title': title})
+                size = (info.get('filesize') or 0) / 1048576
+                self.out_queue.put({'type': 'success', 'url': url, 'title': info['title'], 'size': size, 'path': opts['outtmpl']})
+                self.db.save_download(url, info['title'], "SUCCESS", opts['outtmpl'], size)
         except Exception as e:
-            self.out_queue.put({'type': 'error', 'url': url, 'msg': str(e)[:100]})
-
-# Singleton Engine
-if 'engine' not in st.session_state:
-    st.session_state.engine = DownloadEngine()
-    st.session_state.engine.start()
-    st.session_state.db = DBManager()
-    st.session_state.progress_data = {}
+            self.out_queue.put({'type': 'error', 'url': url, 'msg': f"{type(e).__name__}"})
+            self.db.save_download(url, "Error", "FAILED", "", 0)
 
 # =========================================================
-# INTERFACE STREAMLIT (UI)
+# STREAMLIT UI (CONTROL TOWER)
 # =========================================================
+st.set_page_config(page_title="YoutubeHum Titan", layout="wide")
 
-st.title("🛡️ YoutubeHum Master v6.0")
-
-# Récupération des résultats de la queue de sortie (Update UI)
-while not st.session_state.engine.out_queue.empty():
-    msg = st.session_state.engine.out_queue.get()
-    if msg['type'] == 'progress':
-        st.session_state.progress_data[msg['url']] = msg
-    elif msg['type'] == 'success':
-        st.session_state.db.add_entry(msg['title'], msg['url'], "SUCCESS", "")
-        if msg['url'] in st.session_state.progress_data: 
-            del st.session_state.progress_data[msg['url']]
-    elif msg['type'] == 'error':
-        st.session_state.db.add_entry("Error", msg['url'], f"FAILED: {msg['msg']}", "")
-
-# --- SIDEBAR ---
-with st.sidebar:
-    st.header("🎮 Contrôle Global")
-    c1, c2 = st.columns(2)
-    if c1.button("⏸️ PAUSE"): st.session_state.engine.pause_event.clear()
-    if c2.button("▶️ RESUME"): st.session_state.engine.pause_event.set()
+if 'titan' not in st.session_state:
+    st.session_state.db = Database()
+    st.session_state.titan = TitanEngine(st.session_state.db)
+    st.session_state.monit = {}
     
-    if st.button("🛑 STOP TOUT", type="primary", use_container_width=True):
-        st.session_state.engine.stop_event.set()
-        st.session_state.engine.in_queue = queue.Queue() # Clear queue
-        
+    # Threading de l'event loop asyncio
+    def run_async():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(st.session_state.titan.start_workers(2))
+    threading.Thread(target=run_async, daemon=True).start()
+
+# Communication Engine -> UI
+while not st.session_state.titan.out_queue.empty():
+    msg = st.session_state.titan.out_queue.get()
+    if msg['type'] == 'progress': st.session_state.monit[msg['url']] = msg
+    elif msg['type'] in ['success', 'error']: 
+        if msg['url'] in st.session_state.monit: del st.session_state.monit[msg['url']]
+
+# --- UI LAYOUT ---
+st.title(f"🚀 {Config.VERSION}")
+
+with st.sidebar:
+    st.header("🎮 Dashboard")
+    st.session_state.titan.is_paused = st.toggle("⏸️ Pause Engine")
+    worker_limit = st.slider("Workers Simultanés", 1, 8, 2)
+    if st.button("🗑️ Vider Historique"): st.session_state.db.clear_history()
+    
     st.divider()
-    browser = st.selectbox("Navigateur Cookies", ["firefox", "chrome", "edge", "brave"])
-    workers = st.slider("Max Workers simultanés", 1, 4, 2)
+    st.write(f"💾 RAM: {st.session_state.get('ram', 'N/A')}") # Placeholder stats
+    
+# --- AJOUT TACHES ---
+with st.expander("➕ Ajouter des téléchargements", expanded=True):
+    u_col, p_col = st.columns([3, 1])
+    urls = u_col.text_area("URLs (une par ligne)")
+    folder = p_col.text_input("Dossier", value=str(Path.home() / "Downloads"))
+    mode = st.selectbox("Format", ["MP4 (Vidéo)", "MP3 (Audio)"])
+    
+    if st.button("Lancer la Queue", use_container_width=True):
+        for u in urls.split('\n'):
+            if u.strip():
+                opts = {
+                    'outtmpl': os.path.join(folder, '%(title).80s.%(ext)s'),
+                    'format': 'bestaudio/best' if mode == "MP3" else 'bestvideo+bestaudio/best',
+                }
+                if mode == "MP3": opts['postprocessors'] = [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}]
+                st.session_state.titan.queue.put_nowait((u.strip(), opts))
+        st.toast("Tâches injectées !")
 
-# --- ZONE DE TÉLÉCHARGEMENT ---
-url_input = st.text_area("URLs YouTube (Playlist ou uniques)")
-out_dir = st.text_input("Dossier", value=str(Path.home() / "Downloads"))
-
-if st.button("🚀 AJOUTER À LA QUEUE"):
-    with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': 'in_playlist'}) as ydl:
-        data = ydl.extract_info(url_input, download=False)
-        entries = data.get('entries', [data])
-        
-        for entry in entries[:100]: # Cap à 100 pour sécurité
-            url = entry.get('url') or entry.get('webpage_url')
-            if not url: continue
-            
-            task_opts = {
-                'outtmpl': os.path.join(out_dir, '%(title).80s.%(ext)s'),
-                'cookiesfrombrowser': (browser,),
-                'format': 'bestvideo+bestaudio/best',
-            }
-            st.session_state.engine.in_queue.put({'url': url, 'opts': task_opts})
-    st.success(f"{len(entries)} tâches ajoutées !")
-
-# --- MONITORING TEMPS RÉEL ---
-st.subheader("📥 File d'attente active")
-for url, data in st.session_state.progress_data.items():
-    col_a, col_b = st.columns([1, 4])
-    col_a.write(f"Vitesse: {data['speed']}")
-    col_b.progress(data['p'], text=f"ETA: {data['eta']} | {url[:40]}...")
+# --- MONITORING ---
+st.subheader("🛰️ Monitoring en temps réel")
+if not st.session_state.monit:
+    st.info("Aucun téléchargement actif.")
+else:
+    for url, data in list(st.session_state.monit.items()):
+        col1, col2, col3 = st.columns([1, 4, 1])
+        col1.caption(data['speed'])
+        col2.progress(data['p'], text=f"{url[:50]}...")
+        col3.caption(f"ETA: {data['eta']}")
 
 # --- HISTORIQUE ---
-with st.expander("📜 Historique Persistant (SQLite)"):
-    history = st.session_state.db.cursor.execute("SELECT * FROM history ORDER BY id DESC LIMIT 20").fetchall()
-    if history:
-        for h in history:
-            st.text(f"[{h[4]}] {h[3]} - {h[1][:50]}")
+st.subheader("📜 Historique")
+df = st.session_state.db.get_history()
+st.dataframe(df, use_container_width=True)
 
-# Refresh Loop
+# Boucle de rafraîchissement
 time.sleep(1)
 st.rerun()
