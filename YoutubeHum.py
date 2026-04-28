@@ -1,191 +1,177 @@
 import os
+import asyncio
+import threading
+import queue
+import sqlite3
 import time
+import certifi
 import yt_dlp
 import streamlit as st
-import concurrent.futures
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
-import random
-import re
-import certifi
+from pathlib import Path
 
 # =========================================================
-# CONSTANTES (Correction Analyse GitHub)
+# INITIALISATION ET BASE DE DONNÉES
 # =========================================================
-LOGO_WIDTH = 240
-LOGO_HEIGHT = 40
-LOGO_TEXT_Y = 28
-LOGO_FONT_SIZE = 28
-VERSION_X = 190
-VERSION_FONT_SIZE = 14
-
-DEFAULT_DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
-TEMP_EXTENSIONS = (".jpg", ".png", ".webp", ".part", ".ytdl", ".temp", ".f*")
-DOWNLOAD_TIMEOUT = 900  # 15 minutes
-
-# SOLUTION SSL PROPRE (Plus de hack os.environ)
 os.environ['SSL_CERT_FILE'] = certifi.where()
 
-st.set_page_config(page_title="YoutubeHum Ultimate", page_icon="🎧", layout="wide")
+class DBManager:
+    def __init__(self):
+        self.conn = sqlite3.connect('yt_hum.db', check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS history 
+            (id INTEGER PRIMARY KEY, title TEXT, url TEXT, status TEXT, date TEXT, path TEXT)''')
+        self.conn.commit()
+
+    def add_entry(self, title, url, status, path):
+        self.cursor.execute("INSERT INTO history (title, url, status, date, path) VALUES (?,?,?,?,?)",
+                            (title, url, status, datetime.now().strftime("%Y-%m-%d %H:%M"), path))
+        self.conn.commit()
 
 # =========================================================
-# STYLE ET INITIALISATION
-# =========================================================
-if "stats" not in st.session_state:
-    st.session_state.stats = {"total_downloaded": 0, "total_failed": 0, "total_size_mb": 0}
-if "history" not in st.session_state:
-    st.session_state.history = []
-
-st.markdown(f"""
-<svg width="{LOGO_WIDTH}" height="{LOGO_HEIGHT}">
-  <text x="0" y="{LOGO_TEXT_Y}" fill="#e5e7eb" font-size="{LOGO_FONT_SIZE}" font-family="Inter" font-weight="600">YoutubeHum</text>
-  <text x="{VERSION_X}" y="{LOGO_TEXT_Y}" fill="#10b981" font-size="{VERSION_FONT_SIZE}" font-family="Inter">v3.4</text>
-</svg>
-""", unsafe_allow_html=True)
-
-# =========================================================
-# FONCTIONS TECHNIQUES
+# LE MOTEUR (ENGINE) - DÉCOUPLÉ DE STREAMLIT
 # =========================================================
 
-def clean_temp_files(directory):
-    """Nettoie les fichiers résiduels après téléchargement."""
-    if not os.path.exists(directory): return
-    for root, _, files in os.walk(directory):
-        for f in files:
-            if any(f.endswith(ext) for ext in TEMP_EXTENSIONS):
-                try: os.remove(os.path.join(root, f))
-                except Exception: pass
+class DownloadEngine:
+    def __init__(self):
+        self.in_queue = queue.Queue()
+        self.out_queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.pause_event = threading.Event()
+        self.pause_event.set() # True = Running
+        self.current_tasks = {}
+        self.is_active = False
 
-def get_browser_opts(browser_name, mode, outdir, quality):
-    """Génère les options yt-dlp pour un navigateur donné."""
-    uas = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-    ]
-    
-    opts = {
-        "quiet": True,
-        "no_warnings": False,
-        "outtmpl": os.path.join(outdir, "%(title)s.%(ext)s"),
-        "retries": 10,
-        "nocheckcertificate": False, # Sécurité activée
-        "windowsfilenames": True,
-        "cookiesfrombrowser": (browser_name,), 
-        "http_headers": {
-            "User-Agent": random.choice(uas),
-            "Accept-Language": "fr-FR,fr;q=0.9",
-        }
-    }
+    def start(self):
+        if not self.is_active:
+            self.stop_event.clear()
+            threading.Thread(target=self._run_loop, daemon=True).start()
+            self.is_active = True
 
-    if mode == "MP3":
-        opts.update({
-            "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": quality
-            }, {"key": "FFmpegMetadata"}]
-        })
-    else:
-        opts.update({
-            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "merge_output_format": "mp4"
-        })
-    return opts
+    def _run_loop(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._process_queue())
 
-def process_video(url, mode, outdir, quality):
-    """Tente le téléchargement avec cascade de navigateurs (Firefox > Edge > Chrome)."""
-    start_time = time.time()
-    browsers = ["firefox", "edge", "chrome"]
-    last_error = ""
-
-    for browser in browsers:
-        try:
-            ydl_opts = get_browser_opts(browser, mode, outdir, quality)
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.cache.remove()
-                info = ydl.extract_info(url, download=True)
-                title = info.get('title', 'Vidéo')
-                size = (info.get('filesize') or info.get('filesize_approx') or 0) / (1024*1024)
-                return time.time() - start_time, f"OK ({browser})", title, size
-        except Exception as e:
-            last_error = str(e)
-            if "Cookie" in last_error or "browser" in last_error:
-                continue # Navigateur fermé ou absent, on passe au suivant
-            break 
-
-    # Fallback ultime sans cookies
-    try:
-        fallback_opts = get_browser_opts("firefox", mode, outdir, quality)
-        if "cookiesfrombrowser" in fallback_opts: del fallback_opts["cookiesfrombrowser"]
-        fallback_opts["format"] = "worst/best"
-        with yt_dlp.YoutubeDL(fallback_opts) as ydl:
-            ydl.download([url])
-        return time.time() - start_time, "OK (Sans Cookies)", "Vidéo", 0
-    except Exception as e:
-        return 0, f"Erreur finale : {str(e)[:50]}", "Échec", 0
-
-# =========================================================
-# INTERFACE STREAMLIT
-# =========================================================
-st.write("---")
-url_input = st.text_input("🔗 URL YouTube", placeholder="Collez le lien ici...")
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    mode_selection = st.radio("📁 Format de sortie", ["Vidéo MP4", "Audio MP3"], horizontal=True)
-with c2:
-    mp3_quality = st.selectbox("🎵 Qualité Audio", ["128", "192", "256", "320"], index=3)
-with c3:
-    max_workers = st.slider("⚡ Téléchargements simultanés", 1, 2, 1)
-
-st.write("---")
-
-if st.button("🚀 DÉMARRER", type="primary", use_container_width=True):
-    if not url_input:
-        st.warning("Veuillez entrer un lien.")
-    else:
-        mode = "MP3" if "Audio" in mode_selection else "VIDEO"
-        
-        with st.spinner("Analyse de la source..."):
+    async def _process_queue(self):
+        while not self.stop_event.is_set():
+            self.pause_event.wait() # Blocage propre si pause
+            
             try:
-                with yt_dlp.YoutubeDL({"quiet": True, "extract_flat": "in_playlist"}) as ydl:
-                    data = ydl.extract_info(url_input, download=False)
-                    urls = [e["url"] for e in data.get("entries", []) if e] if "entries" in data else [url_input]
-                    folder_name = re.sub(r'[<>:"/\\|?*]', '', data.get("title", "YoutubeHum"))
-            except Exception as e:
-                st.error(f"Erreur d'analyse : {e}")
-                urls = []
+                task = self.in_queue.get(timeout=1)
+            except queue.Empty:
+                continue
 
-        if urls:
-            session_path = os.path.join(DEFAULT_DOWNLOAD_DIR, f"{folder_name[:30]}_{datetime.now().strftime('%H%M%S')}")
-            os.makedirs(session_path, exist_ok=True)
-            
-            progress_bar = st.progress(0)
-            status_area = st.empty()
-            
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(process_video, u, mode, session_path, mp3_quality): u for u in urls}
-                
-                for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                    elapsed, msg, title, size = future.result()
-                    
-                    if msg.startswith("OK"):
-                        st.success(f"✅ {title[:60]}... ({size:.1f} MB)")
-                        st.session_state.stats["total_downloaded"] += 1
-                        st.session_state.stats["total_size_mb"] += size
-                    else:
-                        st.error(f"❌ {msg}")
-                    
-                    progress_bar.progress((i + 1) / len(urls))
-            
-            clean_temp_files(session_path)
-            st.balloons()
-            st.markdown(f"### 🎉 Terminé ! \n Dossier : `{session_path}`")
-            if st.button("📂 Ouvrir le dossier"):
-                os.startfile(session_path)
+            await self._download_task(task)
+            self.in_queue.task_done()
 
-# Barre latérale de statistiques
-st.sidebar.title("📊 Session")
-st.sidebar.metric("Réussis", st.session_state.stats["total_downloaded"])
-st.sidebar.metric("Volume", f"{st.session_state.stats['total_size_mb']:.1f} MB")
+    async def _download_task(self, task):
+        url = task['url']
+        opts = task['opts']
+        
+        def progress_hook(d):
+            if d['status'] == 'downloading':
+                # Protection division par zéro
+                total = d.get('total_bytes') or d.get('total_bytes_estimate', 1)
+                downloaded = d.get('downloaded_bytes', 0)
+                progress = downloaded / total
+                self.out_queue.put({
+                    'type': 'progress', 
+                    'url': url, 
+                    'p': progress, 
+                    'speed': d.get('_speed_str', '0B/s'),
+                    'eta': d.get('_eta_str', 'N/A')
+                })
+
+        opts['progress_hooks'] = [progress_hook]
+        
+        # Vérification si fichier existe déjà (Skip logique)
+        opts['nooverwrites'] = True
+        
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                # Exécution dans un thread séparé pour ne pas bloquer l'event loop
+                info = await asyncio.to_thread(ydl.extract_info, url, download=True)
+                title = info.get('title', 'Video')
+                self.out_queue.put({'type': 'success', 'url': url, 'title': title})
+        except Exception as e:
+            self.out_queue.put({'type': 'error', 'url': url, 'msg': str(e)[:100]})
+
+# Singleton Engine
+if 'engine' not in st.session_state:
+    st.session_state.engine = DownloadEngine()
+    st.session_state.engine.start()
+    st.session_state.db = DBManager()
+    st.session_state.progress_data = {}
+
+# =========================================================
+# INTERFACE STREAMLIT (UI)
+# =========================================================
+
+st.title("🛡️ YoutubeHum Master v6.0")
+
+# Récupération des résultats de la queue de sortie (Update UI)
+while not st.session_state.engine.out_queue.empty():
+    msg = st.session_state.engine.out_queue.get()
+    if msg['type'] == 'progress':
+        st.session_state.progress_data[msg['url']] = msg
+    elif msg['type'] == 'success':
+        st.session_state.db.add_entry(msg['title'], msg['url'], "SUCCESS", "")
+        if msg['url'] in st.session_state.progress_data: 
+            del st.session_state.progress_data[msg['url']]
+    elif msg['type'] == 'error':
+        st.session_state.db.add_entry("Error", msg['url'], f"FAILED: {msg['msg']}", "")
+
+# --- SIDEBAR ---
+with st.sidebar:
+    st.header("🎮 Contrôle Global")
+    c1, c2 = st.columns(2)
+    if c1.button("⏸️ PAUSE"): st.session_state.engine.pause_event.clear()
+    if c2.button("▶️ RESUME"): st.session_state.engine.pause_event.set()
+    
+    if st.button("🛑 STOP TOUT", type="primary", use_container_width=True):
+        st.session_state.engine.stop_event.set()
+        st.session_state.engine.in_queue = queue.Queue() # Clear queue
+        
+    st.divider()
+    browser = st.selectbox("Navigateur Cookies", ["firefox", "chrome", "edge", "brave"])
+    workers = st.slider("Max Workers simultanés", 1, 4, 2)
+
+# --- ZONE DE TÉLÉCHARGEMENT ---
+url_input = st.text_area("URLs YouTube (Playlist ou uniques)")
+out_dir = st.text_input("Dossier", value=str(Path.home() / "Downloads"))
+
+if st.button("🚀 AJOUTER À LA QUEUE"):
+    with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': 'in_playlist'}) as ydl:
+        data = ydl.extract_info(url_input, download=False)
+        entries = data.get('entries', [data])
+        
+        for entry in entries[:100]: # Cap à 100 pour sécurité
+            url = entry.get('url') or entry.get('webpage_url')
+            if not url: continue
+            
+            task_opts = {
+                'outtmpl': os.path.join(out_dir, '%(title).80s.%(ext)s'),
+                'cookiesfrombrowser': (browser,),
+                'format': 'bestvideo+bestaudio/best',
+            }
+            st.session_state.engine.in_queue.put({'url': url, 'opts': task_opts})
+    st.success(f"{len(entries)} tâches ajoutées !")
+
+# --- MONITORING TEMPS RÉEL ---
+st.subheader("📥 File d'attente active")
+for url, data in st.session_state.progress_data.items():
+    col_a, col_b = st.columns([1, 4])
+    col_a.write(f"Vitesse: {data['speed']}")
+    col_b.progress(data['p'], text=f"ETA: {data['eta']} | {url[:40]}...")
+
+# --- HISTORIQUE ---
+with st.expander("📜 Historique Persistant (SQLite)"):
+    history = st.session_state.db.cursor.execute("SELECT * FROM history ORDER BY id DESC LIMIT 20").fetchall()
+    if history:
+        for h in history:
+            st.text(f"[{h[4]}] {h[3]} - {h[1][:50]}")
+
+# Refresh Loop
+time.sleep(1)
+st.rerun()
